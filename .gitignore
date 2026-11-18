@@ -2,3 +2,6 @@ tools/
 .DS_Store
 Thumbs.db
 *.zip
+.workbuddy/
+*.log
+异常行为采集快照.txt
