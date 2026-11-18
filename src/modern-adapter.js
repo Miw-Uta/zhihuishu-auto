@@ -56,6 +56,8 @@
     endedFastPoll: 0,         // ended 后的 500ms 快轮询句柄（对勾出现/页面重播即停）
     autoAnswer: { round: 0, busy: false }, // 自动作答轮次与并发标志
     noticeOpen: false,        // ai-notice-dialog 打开中
+    noticeConfirmAttempts: 0, // 通知弹窗「好的」确认尝试次数（tick 驱动，4s 间隔）
+    noticeConfirmLastAt: 0,   // 最近一次确认尝试时刻
     lastLogs: [],             // 最近日志环形缓冲（popup 展示用）
   };
 
@@ -223,6 +225,21 @@
   function tryPlay(v, reason) {
     if (!v) return;
     try {
+      // 跳题/切集后页面可能重建 video（readyState=0，元数据未加载）——
+      // 此时直接 play() 会被拒或无效，等 loadedmetadata 后再试一次
+      if (v.readyState === 0) {
+        const onMeta = () => {
+          v.removeEventListener('loadedmetadata', onMeta);
+          if (S.video === v && v.paused) {
+            setTimeout(() => { if (S.video === v && v.paused && !v.ended) tryPlay(v, reason + '·元数据就绪后'); }, 300);
+          }
+        };
+        v.addEventListener('loadedmetadata', onMeta);
+        // 超时保险：8s 内元数据没来就放弃监听（video 可能被替换）
+        setTimeout(() => v.removeEventListener('loadedmetadata', onMeta), 8000);
+        log(`tryPlay（${reason || ''}）：video 元数据未就绪，等待 loadedmetadata`);
+        return;
+      }
       if (v.paused && !v.ended) {
         const p = v.play();
         if (p && typeof p.catch === 'function') {
@@ -602,7 +619,23 @@
       // 纯观察器驱动会永远停在 detected）
       if (S.quizOpen || S.noticeOpen) {
         updateQuizState();
-        return;
+        // 失配自愈（导航栏跳转到答题时间点的场景）：状态机认为弹窗开着，
+        // 但 DOM 里两种弹窗都已消失（平台切集逻辑把弹窗抽走了）——
+        // 若 updateQuizState 一轮后 quizOpen/noticeOpen 仍为 true 而 DOM 已空，
+        // 强制复位，避免续播被永久抑制。
+        const domQuiz = queryFirst(SEL.quizDialog);
+        const domNotice = queryFirst(SEL.noticeDialog);
+        if (!domQuiz && !domNotice && (S.quizOpen || S.noticeOpen)) {
+          warn('弹窗状态失配（状态机为开但 DOM 已无弹窗），强制复位');
+          S.quizOpen = false;
+          S.noticeOpen = false;
+          S.quizState = 'idle';
+          S.quizInfo = null;
+          S.quizCloseAttempts = 0;
+          S.noticeConfirmAttempts = 0;
+          S.quizStateWasPreAnswered = false;
+        }
+        if (S.quizOpen || S.noticeOpen) return;
       }
 
       const v = ensureVideo();
@@ -758,13 +791,37 @@
     }
   }
 
-  /** 通知弹窗（.ai-notice-dialog）检测 —— 只记录状态，点击「好的」交由人工 */
+  /** 通知弹窗（.ai-notice-dialog）检测与自动确认（「好的」按钮，vnode onClick 通道） */
   function checkNoticeDialog() {
     const d = queryFirst(SEL.noticeDialog);
-    const open = Boolean(d);
+    // 可见性判定：.ai-notice-dialog 与答题弹窗一样常驻 DOM（隐藏实例），
+    // 只有真实可见才算"开着"——否则会反复点击已确认的隐藏按钮、并卡死续播
+    let open = false;
+    if (d) {
+      try {
+        const r = d.getBoundingClientRect();
+        open = r.width > 50 && r.height > 50;
+      } catch (e) { open = false; }
+    }
     if (open && !S.noticeOpen) {
       const textEl = d.querySelector('.content-wrapper .text');
-      log(`检测到通知弹窗（${textEl ? (textEl.textContent || '').trim().slice(0, 30) : '无文案'}），请人工点击「好的」关闭`);
+      log(`检测到通知弹窗（${textEl ? (textEl.textContent || '').trim().slice(0, 30) : '无文案'}）`);
+    }
+    // 通知弹窗可见：由 tick 每轮驱动确认尝试（间隔 4s 节流，不依赖"从无到有"事件——
+    // 通知弹窗常与答题弹窗并存，答题弹窗关闭后才具备确认条件，事件模型会漏掉这种场景）
+    if (open && Date.now() - (S.noticeConfirmLastAt || 0) > 4000) {
+      S.noticeConfirmLastAt = Date.now();
+      S.noticeConfirmAttempts = (S.noticeConfirmAttempts || 0) + 1;
+      const res = callMainWorld('noticeConfirm', {});
+      if (res && res.ok) {
+        log(`已确认通知弹窗「好的」（第 ${S.noticeConfirmAttempts} 次）`);
+      } else {
+        log(`通知弹窗确认第 ${S.noticeConfirmAttempts} 次失败：`, res && (res.reason || res.error) || '桥无响应');
+      }
+    }
+    if (!open && S.noticeConfirmAttempts) {
+      S.noticeConfirmAttempts = 0;
+      log('通知弹窗已关闭（确认完成）');
     }
     S.noticeOpen = open;
     return open;

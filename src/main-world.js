@@ -153,8 +153,12 @@
 
     const exec = (cmd, payload) => {
       try {
-        const dlg = visibleDialog();
-        if (!dlg) return { ok: false, reason: 'no_dialog' };
+        // quiz* 命令依赖答题弹窗；noticeConfirm 只依赖通知弹窗——不能用统一守卫
+        // （答题弹窗已关闭时 visibleDialog() 为 null，会把 noticeConfirm 误拒为 no_dialog）
+        if (/^quiz(Select|Submit|Close)$/.test(cmd)) {
+          const dlg = visibleDialog();
+          if (!dlg) return { ok: false, reason: 'no_dialog' };
+        }
 
         if (cmd === 'quizSelect') {
           const idx = Number(payload && payload.index) || 0;
@@ -216,6 +220,32 @@
           return { ok: true, via: 'vnode_onClick' };
         }
 
+        if (cmd === 'noticeConfirm') {
+          // 通知弹窗（.ai-notice-dialog）确认按钮「好的」（.btn）——答题流程收尾确认，
+          // 与选项/提交同一校验体系，走 vnode onClick 通道。
+          // 通知弹窗 DOM 常驻（隐藏实例），必须先校验可见性，避免反复点隐藏按钮
+          const notice = document.querySelector('.ai-notice-dialog');
+          if (!notice) return { ok: false, reason: 'no_notice' };
+          let visible = false;
+          try { const r = notice.getBoundingClientRect(); visible = r.width > 50 && r.height > 50; } catch (e) {}
+          if (!visible) return { ok: false, reason: 'notice_hidden' };
+          const btn = notice.querySelector('.btn');
+          if (!btn) return { ok: false, reason: 'no_notice_btn', btnClasses: [...notice.querySelectorAll('[class]')].slice(0, 6).map((x) => String(x.className).slice(0, 30)) };
+          const scope = notice.closest('.el-overlay') || notice;
+          let all = findVnodesWithClick(scope);
+          if (!all.length) all = findVnodesWithClick(document.body);
+          const cand = all
+            .filter((x) => x.key === 'onClick')
+            .filter((x) => x.el === btn || btn.contains(x.el) || (x.el.contains && x.el.contains(btn)))
+            .sort((a, b) => {
+              const score = (x) => (x.el === btn ? 0 : btn.contains(x.el) ? 1 : 2);
+              return score(a) - score(b);
+            })[0];
+          if (!cand) return { ok: false, reason: 'no_onclick_vnode', hint: '通知弹窗按钮的 onClick 不在 vnode props 上' };
+          cand.fn.call(cand.vnode.component && cand.vnode.component.proxy, undefined);
+          return { ok: true, via: 'vnode_onClick' };
+        }
+
         return { ok: false, reason: 'unknown_cmd' };
       } catch (e) {
         return { ok: false, error: String(e && e.message ? e.message : e) };
@@ -233,7 +263,7 @@
           if (raw) { host.removeAttribute(REQ_ATTR); packet = JSON.parse(raw); }
           else if (ev && ev.detail) packet = typeof ev.detail === 'string' ? JSON.parse(ev.detail) : ev.detail;
         } catch (e) {}
-        if (!packet || !/^quiz(Select|Submit|Close)$/.test(packet.cmd)) return;
+        if (!packet || !/^quiz(Select|Submit|Close)$/.test(packet.cmd) && packet.cmd !== 'noticeConfirm') return;
         let result = null;
         try { result = exec(packet.cmd, packet.payload); } catch (e) { result = { ok: false, error: String(e) }; }
         try { if (host) host.setAttribute(RES_ATTR, JSON.stringify(result)); } catch (e) {}
