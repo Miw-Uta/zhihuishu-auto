@@ -80,6 +80,7 @@ function renderModernStatus(resp) {
     detected: '弹窗已识别',
     awaiting_human: '等待人工作答（弹题）',
     answered: '已提交，自动关闭中',
+    auto_answering: '自动作答中',
   };
   const lines = [];
 
@@ -124,6 +125,8 @@ function renderModernStatus(resp) {
   const t = $('statusText');
   if (t) t.title = lines.join('\n');
 
+  renderStopTimer(resp);
+
   // 统计区沿用同一组计数（新版暂无独立统计字段，展示完成度替代）
   if ($('quizAnswered')) $('quizAnswered').textContent = resp.doneCount || 0;
   if ($('nextClicked')) $('nextClicked').textContent = '—';
@@ -137,6 +140,82 @@ function renderModernStatus(resp) {
     statEls[2].textContent = '自动切集';
     statEls[3].textContent = '人工提示';
   }
+}
+
+/* ---- 定时停止 ---- */
+
+function fmtRemaining(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor(s % 3600 / 60);
+  const sec = s % 60;
+  return (h ? `${h}时` : '') + `${String(m).padStart(2, '0')}分${String(sec).padStart(2, '0')}秒`;
+}
+
+function renderStopTimer(resp) {
+  const box = $('timerStatus');
+  if (!box) return;
+  const timer = resp.stopTimer;
+  if (timer && timer.deadline && resp.stopTimerRemaining != null) {
+    box.textContent = `⏱ 剩余 ${fmtRemaining(resp.stopTimerRemaining)} · 到期${timer.action === 'close' ? '关闭标签页' : '暂停视频'}`;
+    box.classList.add('active');
+  } else {
+    box.textContent = '未设置';
+    box.classList.remove('active');
+    const cancelBtn = $('timerCancel'); // 本函数内自行获取（bindStopTimerUI 里的局部变量在此不可见）
+    if (cancelBtn) cancelBtn.disabled = false;
+  }
+}
+
+function bindStopTimerUI() {
+  const startBtn = $('timerStart');
+  const cancelBtn = $('timerCancel');
+  if (!startBtn || !cancelBtn) return;
+
+  startBtn.addEventListener('click', async () => {
+    const h = Number($('timerHours').value) || 0;
+    const m = Number($('timerMinutes').value) || 0;
+    const s = Number($('timerSeconds').value) || 0;
+    const action = document.querySelector('input[name="timerAction"]:checked')?.value || 'pause';
+    const statusEl = $('timerStatus');
+    const durMs = h * 3600000 + m * 60000 + s * 1000;
+    if (durMs < 10000) {
+      statusEl.textContent = '设置失败：时长至少 10 秒';
+      statusEl.classList.remove('active');
+      return;
+    }
+    const timer = { deadline: Date.now() + durMs, action, durationMs: durMs };
+    // 双通道写入：① 发给内容脚本（立即生效，页面内判定到期）；② 写 storage（持久化，
+    // 内容脚本不在线时由适配器下次初始化恢复；过期设置会被自动清除）
+    let viaContent = false;
+    try {
+      const res = await chrome.runtime.sendMessage({ type: 'ZHS_SET_STOP_TIMER', payload: { hours: h, minutes: m, seconds: s, action } });
+      if (res && res.ok) {
+        viaContent = true;
+        renderStopTimer({ stopTimer: res.timer, stopTimerRemaining: res.timer.deadline - Date.now() });
+      } else if (res && !res.ok) {
+        statusEl.textContent = `设置失败：${res.error || '未知错误'}`;
+        statusEl.classList.remove('active');
+        return;
+      }
+    } catch (e) { /* 内容脚本不可达，走 storage 通道 */ }
+    try {
+      await chrome.storage.local.set({ stopTimer: timer });
+    } catch (e) {}
+    if (!viaContent) {
+      statusEl.textContent = `⏱ 已设置（${fmtRemaining(durMs)}后${action === 'close' ? '关闭标签页' : '暂停视频'}）· 课程页未就绪，刷新页面后生效`;
+      statusEl.classList.add('active');
+    }
+  });
+
+  cancelBtn.addEventListener('click', async () => {
+    try {
+      await chrome.runtime.sendMessage({ type: 'ZHS_CANCEL_STOP_TIMER' });
+      renderStopTimer({ stopTimer: null, stopTimerRemaining: null });
+    } catch (e) {
+      renderStopTimer({ stopTimer: null, stopTimerRemaining: null });
+    }
+  });
 }
 
 function render() {
@@ -248,11 +327,45 @@ function renderStatus(resp) {
 }
 
 async function refreshStatus() {
+  // 定时器状态独立于内容脚本：直接读 storage（即使消息通道不可达也持续显示倒计时）
+  let storageTimer = null;
+  try {
+    const got = await chrome.storage.local.get('stopTimer');
+    storageTimer = (got && got.stopTimer) || null;
+  } catch (e) {}
+
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const tab = tabs && tabs[0];
     if (!tab || !tab.id) {
       setStatus('off', '没有活动标签页');
+      renderStopTimer({ stopTimer: storageTimer, stopTimerRemaining: storageTimer ? storageTimer.deadline - Date.now() : null });
+      return;
+    }
+    // 优先读 storage 快照（hostname 键，零消息依赖、100% 可靠）：
+    // 活动标签页 URL 与快照 href 匹配才采用（避免读错标签页的快照）
+    let storedSnap = null;
+    let failReason = 'storage无快照';
+    try {
+      const host = new URL(tab.url || '').hostname;
+      const key = 'zhs-snap-' + host;
+      const got = await chrome.storage.local.get(key);
+      const entry = got && got[key];
+      if (!entry || !entry.payload) failReason = 'storage无快照';
+      else if (Date.now() - entry.ts >= 15000) failReason = `快照过期(${Math.round((Date.now() - entry.ts) / 1000)}s)`;
+      else if (entry.href.split('#')[0] !== (tab.url || '').split('#')[0]) failReason = 'URL不匹配';
+      else storedSnap = entry.payload;
+    } catch (e) { failReason = '读取异常:' + String(e && e.message || e).slice(0, 40); }
+    if (storedSnap) {
+      renderModernStatus(storedSnap);
+      renderStopTimer({ stopTimer: storageTimer, stopTimerRemaining: storageTimer ? storageTimer.deadline - Date.now() : null });
+      return;
+    }
+    // storage 快照缺失/过期：background 快照表兜底
+    const snap = await chrome.runtime.sendMessage({ type: 'ZHS_GET_SNAPSHOT', tabId: tab.id }).catch(() => null);
+    if (snap && snap.ok && snap.snapshot) {
+      renderModernStatus(snap.snapshot);
+      renderStopTimer({ stopTimer: storageTimer, stopTimerRemaining: storageTimer ? storageTimer.deadline - Date.now() : null });
       return;
     }
     const resp = await chrome.tabs.sendMessage(tab.id, { type: 'ZHS_GET_STATUS' }).catch(() => null);
@@ -265,14 +378,25 @@ async function refreshStatus() {
       renderStatus(resp);
       return;
     }
-    // 旧响应不存在：区分「新版页面但适配器未就绪」与「非课程页」
+    // 快照与直连均失败：若 background 有 60s 内的陈旧快照也用它（内容脚本可能被节流）
+    const stale = snap && snap.ok ? snap.snapshot : null;
+    if (stale) {
+      renderModernStatus({ ...stale, paused: true });
+      renderStopTimer({ stopTimer: storageTimer, stopTimerRemaining: storageTimer ? storageTimer.deadline - Date.now() : null });
+      return;
+    }
+    // 全部失败：区分「新版页面但适配器未就绪」与「非课程页」，并附失败阶段
     if (/^https?:\/\/([^/]+\.)?wisdom-mooc\.zhihuishu\.com\//i.test(tab.url || '')) {
-      setStatus('warn', '新版页面已注入，适配器启动中…（若长时间无响应请刷新页面）');
+      setStatus('warn', `新版页面已注入但状态获取失败（${failReason}）；请刷新页面`);
     } else {
-      setStatus('warn', '当前标签页不是智慧树课程页');
+      setStatus('warn', `当前标签页不是智慧树课程页（${failReason}）`);
     }
   } catch (e) {
     setStatus('warn', '当前标签页不是智慧树课程页');
+  }
+  // 内容脚本不可达时仍展示定时倒计时（storage 数据）
+  if (storageTimer && storageTimer.deadline) {
+    renderStopTimer({ stopTimer: storageTimer, stopTimerRemaining: storageTimer.deadline - Date.now() });
   }
 }
 
@@ -365,6 +489,8 @@ async function init() {
     } catch (e) {}
     renderStats(EMPTY_STATS);
   });
+
+  bindStopTimerUI();
 
   refreshTimer = setInterval(refreshStatus, 1500);
   window.addEventListener('unload', () => clearInterval(refreshTimer));

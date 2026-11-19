@@ -10,7 +10,7 @@
     <header>
       <div class="title">
         智慧树自动刷课
-        <span class="ver">v0.8.0</span>
+        <span class="ver">v0.9.0</span>
       </div>
       <label class="switch" title="总开关">
         <input type="checkbox" id="enabled" />
@@ -98,6 +98,29 @@
         <div class="ai-hint" id="aiHint">
           用于自动识别「请点击灰色大写U」等 3D 立体字安全验证。
         </div>
+      </div>
+    </section>
+
+    <section class="rows" id="stopTimerBox">
+      <label class="row">
+        <span>定时停止</span>
+        <span class="timer-inputs">
+          <input type="number" id="timerHours" min="0" max="23" placeholder="时" />时
+          <input type="number" id="timerMinutes" min="0" max="59" placeholder="分" />分
+          <input type="number" id="timerSeconds" min="0" max="59" placeholder="秒" />秒
+        </span>
+      </label>
+      <label class="row">
+        <span>到期动作</span>
+        <span class="timer-actions">
+          <label><input type="radio" name="timerAction" value="pause" checked /> 暂停视频</label>
+          <label><input type="radio" name="timerAction" value="close" /> 关闭标签页</label>
+        </span>
+      </label>
+      <div class="row timer-status" id="timerStatus">未设置</div>
+      <div class="row timer-btns">
+        <button type="button" id="timerStart">启动定时</button>
+        <button type="button" id="timerCancel" class="ghost">取消</button>
       </div>
     </section>
 

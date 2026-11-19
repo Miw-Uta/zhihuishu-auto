@@ -155,9 +155,10 @@
       try {
         // quiz* 命令依赖答题弹窗；noticeConfirm 只依赖通知弹窗——不能用统一守卫
         // （答题弹窗已关闭时 visibleDialog() 为 null，会把 noticeConfirm 误拒为 no_dialog）
-        if (/^quiz(Select|Submit|Close)$/.test(cmd)) {
-          const dlg = visibleDialog();
-          if (!dlg) return { ok: false, reason: 'no_dialog' };
+        // dlg 必须声明在函数级：quizSelect/Submit/Close 三个分支都要用
+        const dlg = /^quiz(Select|Submit|Close)$/.test(cmd) ? visibleDialog() : null;
+        if (/^quiz(Select|Submit|Close)$/.test(cmd) && !dlg) {
+          return { ok: false, reason: 'no_dialog' };
         }
 
         if (cmd === 'quizSelect') {

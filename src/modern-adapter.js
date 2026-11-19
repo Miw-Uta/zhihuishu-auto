@@ -58,6 +58,9 @@
     noticeOpen: false,        // ai-notice-dialog 打开中
     noticeConfirmAttempts: 0, // 通知弹窗「好的」确认尝试次数（tick 驱动，4s 间隔）
     noticeConfirmLastAt: 0,   // 最近一次确认尝试时刻
+    // ---- 定时停止（用户设置的播放时长，到期暂停视频或关闭标签页） ----
+    stopTimer: null,          // { deadline: 目标时间戳, action: 'pause'|'close' } | null
+    stopPaused: false,        // 定时暂停生效中（play 事件/取消定时/重设定时解除）
     lastLogs: [],             // 最近日志环形缓冲（popup 展示用）
   };
 
@@ -72,6 +75,11 @@
   }
   function warn(...args) {
     console.warn('[ZHS-M]', ...args);
+    // warn 也进环形缓冲：失败原因必须能在快照里看到（否则诊断断链）
+    try {
+      S.lastLogs.push({ t: new Date().toISOString().slice(11, 19), msg: '[W] ' + args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ') });
+      if (S.lastLogs.length > 30) S.lastLogs.shift();
+    } catch (e) {}
   }
 
   // ---------- 基础工具 ----------
@@ -166,12 +174,19 @@
     S.boundVideo = v;
 
     v.addEventListener('play', () => {
+      // 用户手动播放：清除定时暂停状态（自动路径不经过 tryPlay，不影响）
+      if (S.stopPaused) {
+        S.stopPaused = false;
+        log('手动播放，定时暂停状态已解除');
+      }
       S.endedPending = false;
       log('事件 play · t=' + Math.round(v.currentTime || 0));
     });
 
     v.addEventListener('pause', () => {
       log('事件 pause · t=' + Math.round(v.currentTime || 0));
+      // 定时停止刚触发：这次 pause 是插件自己的动作，不自动续播
+
       // 弹窗/未识别弹窗存在时，暂停是页面自身行为，不自动续播（第三批接入后在此分支）
       if (S.quizOpen || S.blockedDialogOpen) return;
       if (!S.settings.enabled || !S.settings.keepPlaying) return;
@@ -182,6 +197,8 @@
         if (S.video !== v || !v.paused) return;
         if (v.ended) return;
         if (S.quizOpen || S.blockedDialogOpen) return;
+        // 定时停止生效期间不自动续播（用户设定的停止时长优先）
+  
         tryPlay(v, 'pause 恢复');
       }, 1200);
     });
@@ -224,6 +241,12 @@
    */
   function tryPlay(v, reason) {
     if (!v) return;
+    // 定时暂停生效中：一切自动恢复播放让路（答题续播/切集续播/stall 恢复等）——
+    // 用户手动点播放会触发 play 事件并清除 stopPaused 位，之后一切恢复常态
+    if (S.stopPaused) {
+      log(`tryPlay（${reason || ''}）被定时暂停抑制`);
+      return;
+    }
     try {
       // 跳题/切集后页面可能重建 video（readyState=0，元数据未加载）——
       // 此时直接 play() 会被拒或无效，等 loadedmetadata 后再试一次
@@ -608,11 +631,62 @@
     runSwitch(next);
   }
 
+  // ---------- 定时停止（播放时长计时器） ----------
+
+  /**
+   * 定时器到期判定（tick 每轮驱动，基于 Date.now() 与目标时间戳对比——
+   * 标签页休眠/后台节流不影响准确性，唤醒即触发）。
+   * 到期动作：
+   *   pause → 暂停视频并置 stopTimerPause 位（pause 自动续播逻辑见此位让路）
+   *   close → chrome.tabs.remove 关闭当前标签页
+   * 到期后清除定时状态（storage 同步清除）。
+   */
+  async function fireStopTimer() {
+    const timer = S.stopTimer;
+    const action = (timer && timer.action) || 'pause';
+    S.stopTimer = null;
+
+    try {
+      try { await chrome.storage.local.remove('stopTimer'); } catch (e) {}
+    } catch (e) {}
+    log(`定时停止触发（策略 ${action}）`);
+    if (action === 'close') {
+      // 关闭标签页走 background（tabs API 在 SW 上下文最可靠；
+      // 内容脚本的 tabs.query({currentWindow}) 在部分场景解析异常）
+      try {
+        const res = await chrome.runtime.sendMessage({ type: 'ZHS_CLOSE_CURRENT_TAB' });
+        if (res && res.ok) {
+          return; // 页面已关闭，后续无需执行
+        }
+        warn('关闭标签页未成功（background 返回）:', res && res.error, '回退为暂停视频');
+      } catch (e) {
+        warn('关闭标签页消息失败（回退为暂停视频）:', e && e.message);
+      }
+    }
+    // pause 策略（及 close 失败回退）
+    S.stopPaused = true;
+    const v = ensureVideo();
+    if (v) {
+      try { v.pause(); } catch (e) {}
+      log(`视频已暂停（定时停止）· t=${Math.round(v.currentTime || 0)} · 手动点播放可恢复`);
+    }
+  }
+
+  function checkStopTimer() {
+    if (!S.stopTimer) return;
+    if (Date.now() >= S.stopTimer.deadline) {
+      void fireStopTimer();
+    }
+  }
+
   // ---------- 主循环 ----------
 
   function tick() {
     try {
       if (!S.settings.enabled) return;
+
+      // 定时停止：即使弹窗开着也要判定到期（弹题自动作答中途到点同样生效）
+      checkStopTimer();
 
       // 弹窗存在时：不做播放操作，但保持弹窗状态机心跳（每秒强制重读，
       // 不依赖 DOM 变化触发——题目异步加载/已答状态若无后续 attribute 变化，
@@ -696,6 +770,8 @@
       blockedDialogOpen: S.blockedDialogOpen,
       switchLocked: Date.now() < S.switchLockUntil,
       needsManualSwitch: S.needsManualSwitch,
+      stopTimer: S.stopTimer,
+      stopTimerRemaining: S.stopTimer ? Math.max(0, S.stopTimer.deadline - Date.now()) : null,
       playerMethods: S.playerMethods,
       logs: [...S.lastLogs],
     };
@@ -709,6 +785,30 @@
         if (!msg) return false;
         if (msg.type === 'ZHS_GET_STATUS' || msg.type === 'ZHS_SCAN_NOW') {
           sendResponse(statusPayload());
+          return false;
+        }
+        // 定时停止：设置 / 取消
+        if (msg.type === 'ZHS_SET_STOP_TIMER') {
+          const p = msg.payload || {};
+          const durMs = (Number(p.hours) || 0) * 3600000 + (Number(p.minutes) || 0) * 60000 + (Number(p.seconds) || 0) * 1000;
+          if (durMs < 10000) {
+            sendResponse({ ok: false, error: '时长至少 10 秒' });
+            return false;
+          }
+          const action = p.action === 'close' ? 'close' : 'pause';
+          S.stopPaused = false; // 重新设置定时会解除上一轮的暂停状态
+          S.stopTimer = { deadline: Date.now() + durMs, action, durationMs: durMs };
+          try { chrome.storage.local.set({ stopTimer: S.stopTimer }); } catch (e) {}
+          log(`定时停止已设置：${Math.floor(durMs / 3600000)}时${Math.floor(durMs % 3600000 / 60000)}分${Math.round(durMs % 60000 / 1000)}秒后${action === 'close' ? '关闭标签页' : '暂停视频'}`);
+          sendResponse({ ok: true, timer: S.stopTimer });
+          return false;
+        }
+        if (msg.type === 'ZHS_CANCEL_STOP_TIMER') {
+          S.stopTimer = null;
+          S.stopPaused = false;
+          try { chrome.storage.local.remove('stopTimer'); } catch (e) {}
+          log('定时停止已取消（暂停状态一并解除）');
+          sendResponse({ ok: true });
           return false;
         }
         return false;
@@ -912,6 +1012,12 @@
         }
       }
 
+      // 自动作答进行中：由 tick/观察器每轮驱动重试（busy 期间跳过）——
+      // 之前重试驱动被删导致桥瞬态失败后永久卡 awaiting_human
+      if (S.quizState === 'auto_answering' && !S.autoAnswer.busy) {
+        runAutoAnswer();
+      }
+
       // 「已提交」终态且弹窗滞留：自动关闭（vnode onClick 通道，header-icon 为实测关闭入口）。
       // 关闭最多尝试 3 次（间隔递增），弹窗消失即停。
       if (S.quizState === 'answered' && info.submitted && S.quizCloseAttempts < 3 && !S.quizCloseTimer) {
@@ -987,19 +1093,27 @@
   const REQ_ATTR = 'data-zhs-req';
   const RES_ATTR = 'data-zhs-res';
 
-  /** 同步调用 MAIN world 的 vnode 桥（旧版 callMainWorld 同款实现） */
+  /** 同步调用 MAIN world 的 vnode 桥（旧版 callMainWorld 同款实现；瞬态失败重试一次） */
   function callMainWorld(cmd, payload = {}) {
-    const host = document.head || document.documentElement;
-    if (!host) return null;
-    try {
-      host.setAttribute(REQ_ATTR, JSON.stringify({ cmd, payload }));
-      window.dispatchEvent(new Event(REQ_EVENT));
-      const raw = host.getAttribute(RES_ATTR);
-      if (raw) {
-        host.removeAttribute(RES_ATTR);
-        return JSON.parse(raw);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const host = document.head || document.documentElement;
+      if (!host) return null;
+      try {
+        host.removeAttribute(RES_ATTR); // 清除上一轮残留响应，避免读到旧值
+        host.setAttribute(REQ_ATTR, JSON.stringify({ cmd, payload }));
+        window.dispatchEvent(new Event(REQ_EVENT));
+        const raw = host.getAttribute(RES_ATTR);
+        if (raw) {
+          host.removeAttribute(RES_ATTR);
+          return JSON.parse(raw);
+        }
+      } catch (e) {}
+      if (attempt === 0) {
+        // 同步重试一次：属性桥瞬态竞态（事件派发与响应写入之间偶发丢失）
+        // 实测该竞态在页面忙时偶发，一次重试即可恢复
+        continue;
       }
-    } catch (e) {}
+    }
     return null;
   }
 
@@ -1157,6 +1271,11 @@
       }
 
       await sleep(rand(AA.submitDelayMs || [1200, 2600]));
+      // 页面可能在选项点击后自行提交/关闭弹窗（实测时序）——弹窗已消失则视为流程已完成
+      if (!getVisibleQuizDialog()) {
+        log('提交前弹窗已消失（页面自行结束），流程完成');
+        return;
+      }
       const sub = callMainWorld('quizSubmit', {});
       if (sub && sub.ok) {
         log('已提交作答，等待页面反馈…');
@@ -1242,6 +1361,37 @@
       bindDialogObserver();
       bindRouteWatcher();
 
+      // 恢复持久化的定时停止设置（页面刷新/扩展重载不丢失；过期则清除）
+      // 同时监听 storage 变化：popup 在内容脚本不可达时走 storage 兜底通道，
+      // 这里实时接管（不依赖内容脚本消息通道）
+      try {
+        chrome.storage.local.get(['stopTimer']).then(({ stopTimer }) => {
+          if (!stopTimer || !stopTimer.deadline) return;
+          if (Date.now() >= stopTimer.deadline) {
+            chrome.storage.local.remove('stopTimer');
+            log('发现已过期的定时停止设置，已清除');
+            return;
+          }
+          S.stopTimer = stopTimer;
+          const remain = Math.round((stopTimer.deadline - Date.now()) / 1000);
+          log(`已恢复定时停止：剩余 ${Math.floor(remain / 3600)}时${Math.floor(remain % 3600 / 60)}分${remain % 60}秒（策略 ${stopTimer.action}）`);
+        }).catch(() => {});
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area !== 'local' || !changes.stopTimer) return;
+          const t = changes.stopTimer.newValue;
+          if (!t || !t.deadline) {
+            if (S.stopTimer) { S.stopTimer = null; log('定时停止已取消（storage）'); }
+            return;
+          }
+          // popup 设置的新定时（内容脚本消息通道没送达时，storage 兜底通道生效）
+          if (!S.stopTimer || S.stopTimer.deadline !== t.deadline) {
+            S.stopTimer = t;
+            const remain = Math.round((t.deadline - Date.now()) / 1000);
+            log(`已接管定时停止（storage 通道）：剩余 ${Math.floor(remain / 3600)}时${Math.floor(remain % 3600 / 60)}分${remain % 60}秒（策略 ${t.action}）`);
+          }
+        });
+      } catch (e) {}
+
       const probe = probeAblePlayer();
       S.playerMethods = probe.methods;
 
@@ -1281,6 +1431,18 @@
         manualSwitch: st.needsManualSwitch ? st.needsManualSwitch.num + ' ' + st.needsManualSwitch.name : null,
         logs: st.logs.slice(-6).map((x) => x.t + ' ' + x.msg),
       }));
+      // 同步一份到 storage.local（按 tabId 分键）：popup 读状态零消息依赖——
+      // storage 读取在任何上下文都 100% 可靠；tabId 由 background 转发时附带，
+      // 或内容脚本从自身会话取（无 tabs 权限时退化为 hostname 键）
+      try {
+        chrome.runtime.sendMessage({ type: 'ZHS_SNAPSHOT', payload: st }).catch(() => {});
+      } catch (e) {}
+      try {
+        const hostKey = 'zhs-snap-' + location.hostname;
+        chrome.storage.local.set({
+          [hostKey]: { payload: st, ts: Date.now(), href: location.href },
+        });
+      } catch (e) {}
     } catch (e) {
       // 快照失败也要留痕（如 Extension context invalidated），方便诊断上下文死亡
       try { console.warn('[ZHS-M] 快照发布失败:', e && e.message); } catch (e2) {}

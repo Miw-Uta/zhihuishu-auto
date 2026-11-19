@@ -327,8 +327,45 @@ async function solveSpaceCaptchaByAI({ imageUrl, imageDataUrl, promptText, width
   };
 }
 
+// 内容脚本每 2 秒发布的适配器快照：按 tabId 存入内存表，供 popup 读取
+// （tabs.sendMessage 直连内容脚本在部分场景间歇失败，此表是可靠的状态来源）
+const snapshotByTab = new Map();
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return false;
+
+  if (msg.type === 'ZHS_SNAPSHOT' && sender.tab && sender.tab.id != null) {
+    snapshotByTab.set(sender.tab.id, { payload: msg.payload, ts: Date.now() });
+    // 清理已关闭标签页的陈旧快照（防内存增长）
+    if (snapshotByTab.size > 50) {
+      const now = Date.now();
+      for (const [id, v] of snapshotByTab) {
+        if (now - v.ts > 60000) snapshotByTab.delete(id);
+      }
+    }
+    return false; // 不需要响应
+  }
+
+  if (msg.type === 'ZHS_GET_SNAPSHOT') {
+    const tabId = msg.tabId;
+    const entry = snapshotByTab.get(tabId);
+    const fresh = entry && Date.now() - entry.ts < 10000;
+    sendResponse({ ok: true, snapshot: fresh ? entry.payload : null, ts: entry ? entry.ts : null });
+    return false;
+  }
+
+  if (msg.type === 'ZHS_CLOSE_CURRENT_TAB') {
+    // 定时停止的「关闭标签页」策略：关闭发起消息的内容脚本所在标签页
+    const tabId = sender.tab && sender.tab.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: '无法定位发起方标签页' });
+      return false;
+    }
+    chrome.tabs.remove(tabId)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: String(err && err.message || err) }));
+    return true; // 异步响应
+  }
 
   if (msg.type === 'ZHS_SOLVE_CAPTCHA') {
     solveSpaceCaptchaByAI(msg.payload || {})
