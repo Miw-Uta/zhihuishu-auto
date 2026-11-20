@@ -323,6 +323,9 @@ function renderStatus(resp) {
   } else {
     setStatus('on', `播放中 ${fmt(resp.time)} / ${fmt(resp.duration)}${progTag}`);
   }
+  if (resp.stopTimer) {
+    renderStopTimer({ stopTimer: resp.stopTimer, stopTimerRemaining: resp.stopTimerRemaining });
+  }
   if (resp.stats) renderStats(resp.stats);
 }
 

@@ -110,6 +110,9 @@
     jumpTried: false,
     blocked: false,
     badge: null,
+    // ---- 定时停止（与新版适配器同款机制） ----
+    stopTimer: null,          // { deadline, action: 'pause'|'close', durationMs } | null
+    stopPaused: false,        // 定时暂停生效中（play 事件/取消定时/重设定时解除）
   };
 
   // ---------- 基础工具 ----------
@@ -289,12 +292,21 @@
     if (S.boundVideo === v) return;
     S.boundVideo = v;
 
+    v.addEventListener('play', () => {
+      // 用户手动播放：解除定时暂停状态（自动路径不经过 tryPlay，不影响）
+      if (S.stopPaused) {
+        S.stopPaused = false;
+        log('手动播放，定时暂停状态已解除');
+      }
+    });
+
     v.addEventListener('ended', () => {
       S.endedSrc = v.currentSrc || v.src || '';
       scheduleEndCheck(rand(2800, 4800));
     });
 
     v.addEventListener('pause', () => {
+      if (S.stopPaused) return; // 定时暂停生效中不自动续播
       if (!S.settings.keepPlaying || !S.settings.enabled) return;
       setTimeout(() => {
         if (!S.video || S.video !== v) return;
@@ -324,7 +336,7 @@
 
     v.addEventListener('waiting', () => {
       setTimeout(() => {
-        if (S.video === v && v.paused && !S.quizOpen) tryPlay(v);
+        if (S.video === v && v.paused && !S.quizOpen && !S.stopPaused) tryPlay(v);
       }, 3000);
     });
 
@@ -334,6 +346,11 @@
 
   function tryPlay(v) {
     if (!v) return;
+    // 定时暂停生效中：一切自动恢复播放让路（用户手动点播放触发 play 事件解除）
+    if (S.stopPaused) {
+      log(`tryPlay 被定时暂停抑制（${v.id || 'video'}）`);
+      return;
+    }
     if (S.settings.mute && !v.muted) {
       try { v.muted = true; } catch (e) {}
     }
@@ -969,6 +986,44 @@
       : `智慧树助手 ON${extra}`;
   }
 
+  // ---------- 定时停止（与新版适配器同款机制） ----------
+
+  /**
+   * 定时器到期判定（tick 每轮驱动，基于 Date.now() 与目标时间戳对比）。
+   * pause → 暂停视频并置 stopPaused 位（一切自动续播让路，手动播放解除）
+   * close → 经 background 关闭当前标签页（sender.tab 精确定位），失败回退暂停
+   */
+  async function fireStopTimer() {
+    const timer = S.stopTimer;
+    const action = (timer && timer.action) || 'pause';
+    S.stopTimer = null;
+    log(`定时停止触发（策略 ${action}）`);
+    if (action === 'close') {
+      try {
+        const res = await chrome.runtime.sendMessage({ type: 'ZHS_CLOSE_CURRENT_TAB' });
+        if (res && res.ok) return; // 页面已关闭
+        warn('关闭标签页未成功（background 返回）:', res && res.error, '回退为暂停视频');
+      } catch (e) {
+        warn('关闭标签页消息失败（回退为暂停视频）:', e && e.message);
+      }
+    }
+    // pause 策略（及 close 失败回退）
+    S.stopPaused = true;
+    const v = ensureVideo();
+    if (v) {
+      try { v.pause(); } catch (e) {}
+      log(`视频已暂停（定时停止）· t=${Math.round(v.currentTime || 0)} · 手动点播放可恢复`);
+    }
+    renderBadge();
+  }
+
+  function checkStopTimer() {
+    if (!S.stopTimer) return;
+    if (Date.now() >= S.stopTimer.deadline) {
+      void fireStopTimer();
+    }
+  }
+
   // ---------- 主循环 ----------
 
   function tick() {
@@ -980,6 +1035,9 @@
       renderBadge();
       return;
     }
+
+    // 定时停止：即使弹窗/验证码开着也要判定到期
+    checkStopTimer();
 
     if (location.href !== S.lastHref) {
       log('页面地址变化，重置状态');
@@ -1079,6 +1137,8 @@
       captchaPrompt: st && st.captchaState ? st.captchaState.promptText : '',
       captchaErrorHint: S.captchaErrorHint || '',
       blocked: S.blocked,
+      stopTimer: S.stopTimer,
+      stopTimerRemaining: S.stopTimer ? Math.max(0, S.stopTimer.deadline - Date.now()) : null,
       stats: { ...S.stats },
     };
   }
@@ -1090,6 +1150,30 @@
         if (msg.type === 'ZHS_GET_STATUS' || msg.type === 'ZHS_SCAN_NOW') {
           if (msg.type === 'ZHS_SCAN_NOW') tick();
           sendResponse(statusPayload());
+          return false;
+        }
+        // 定时停止：设置 / 取消（与新版适配器同款命令）
+        if (msg.type === 'ZHS_SET_STOP_TIMER') {
+          const p = msg.payload || {};
+          const durMs = (Number(p.hours) || 0) * 3600000 + (Number(p.minutes) || 0) * 60000 + (Number(p.seconds) || 0) * 1000;
+          if (durMs < 10000) {
+            sendResponse({ ok: false, error: '时长至少 10 秒' });
+            return false;
+          }
+          const action = p.action === 'close' ? 'close' : 'pause';
+          S.stopPaused = false;
+          S.stopTimer = { deadline: Date.now() + durMs, action, durationMs: durMs };
+          try { chrome.storage.local.set({ stopTimer: S.stopTimer }); } catch (e) {}
+          log(`定时停止已设置：${Math.floor(durMs / 3600000)}时${Math.floor(durMs % 3600000 / 60000)}分${Math.round(durMs % 60000 / 1000)}秒后${action === 'close' ? '关闭标签页' : '暂停视频'}`);
+          sendResponse({ ok: true, timer: S.stopTimer });
+          return false;
+        }
+        if (msg.type === 'ZHS_CANCEL_STOP_TIMER') {
+          S.stopTimer = null;
+          S.stopPaused = false;
+          try { chrome.storage.local.remove('stopTimer'); } catch (e) {}
+          log('定时停止已取消（暂停状态一并解除）');
+          sendResponse({ ok: true });
           return false;
         }
         return false;
@@ -1128,6 +1212,35 @@
     bindMessaging();
     connectKeepAlivePort();
     bindObserver();
+    // 恢复持久化的定时停止设置（页面刷新/扩展重载不丢失；过期则清除）
+    try {
+      chrome.storage.local.get(['stopTimer']).then(({ stopTimer }) => {
+        if (!stopTimer || !stopTimer.deadline) return;
+        if (Date.now() >= stopTimer.deadline) {
+          chrome.storage.local.remove('stopTimer');
+          log('发现已过期的定时停止设置，已清除');
+          return;
+        }
+        S.stopTimer = stopTimer;
+        const remain = Math.round((stopTimer.deadline - Date.now()) / 1000);
+        log(`已恢复定时停止：剩余 ${Math.floor(remain / 3600)}时${Math.floor(remain % 3600 / 60)}分${remain % 60}秒（策略 ${stopTimer.action}）`);
+      }).catch(() => {});
+      // popup 在消息通道不可达时走 storage 兜底，这里实时接管
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local' || !changes.stopTimer) return;
+        const t = changes.stopTimer.newValue;
+        if (!t || !t.deadline) {
+          if (S.stopTimer) { S.stopTimer = null; S.stopPaused = false; log('定时停止已取消（storage）'); }
+          return;
+        }
+        if (!S.stopTimer || S.stopTimer.deadline !== t.deadline) {
+          S.stopPaused = false;
+          S.stopTimer = t;
+          const remain = Math.round((t.deadline - Date.now()) / 1000);
+          log(`已接管定时停止（storage 通道）：剩余 ${Math.floor(remain / 3600)}时${Math.floor(remain % 3600 / 60)}分${remain % 60}秒（策略 ${t.action}）`);
+        }
+      });
+    } catch (e) {}
     window.__ZHS_STATUS__ = () => statusPayload();
     setInterval(tick, 900);
     tick();
